@@ -27,11 +27,14 @@ Your settings and data are saved in a folder in your home directory
 passwords or tokens to GitHub.
 """
 
+import gzip
 import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import secrets
 import smtplib
 import sqlite3
 import sys
@@ -77,6 +80,8 @@ DEFAULTS = {
 }
 SECRET_KEYS = ("token", "ical_url", "smtp_pass", "youtube_key", "anthropic_key")
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+EXT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "duey-extension")
+EXT_HINT = " Or choose Browser extension in settings \u2014 it works without a security key."
 
 # Built-in sender so students only type their email. Set these as environment variables on
 # the machine running Duey (use a dedicated throwaway mail account, never a personal one).
@@ -120,6 +125,8 @@ def save_cfg(cfg):
 
 
 def configured(cfg):
+    if cfg.get("mode") == "ext":
+        return meta_get("ext_paired") == "1"
     if cfg.get("mode") == "api":
         return bool(cfg.get("base_url") and cfg.get("token"))
     return bool(cfg.get("ical_url"))
@@ -134,6 +141,7 @@ BROWSER_HEADERS = {
                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
     "Accept": "application/json, text/calendar, text/html, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip",
 }
 
 _BLOCK_MARKERS = (
@@ -158,18 +166,44 @@ def _diagnose_block(body):
     return None
 
 
-def http(url, data=None, headers=None, timeout=30):
+def _slow_msg(host, timeout):
+    return ("%s took longer than %d seconds to answer. It may just be slow right now, and Duey will keep "
+            "trying. If it keeps happening, open your calendar link in a browser to see whether it loads." % (host, timeout))
+
+
+def _read_body(r):
+    raw = r.read()
+    if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+    return raw.decode("utf-8", "replace")
+
+
+def http(url, data=None, headers=None, timeout=30, retries=0):
+    """Fetch a URL. Slow portals get a second try before we give up."""
+    for attempt in range(retries + 1):
+        try:
+            return _http_once(url, data, headers, timeout)
+        except DueyError as e:
+            if e.code != "timeout" or attempt == retries:
+                raise
+            time.sleep(2)
+
+
+def _http_once(url, data=None, headers=None, timeout=30):
     url = (url or "").strip()
     send_headers = dict(BROWSER_HEADERS)
     send_headers.update(headers or {})
     req = urllib.request.Request(url, data=data, headers=send_headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read().decode("utf-8", "replace"), r.headers
+            return _read_body(r), r.headers
     except urllib.error.HTTPError as e:
         body = ""
         try:
-            body = e.read().decode("utf-8", "replace")
+            body = _read_body(e)
         except Exception:
             pass
         blocked = _diagnose_block(body)
@@ -187,13 +221,14 @@ def http(url, data=None, headers=None, timeout=30):
     except urllib.error.URLError as e:
         host = urllib.parse.urlparse(url).netloc or url
         reason = getattr(e, "reason", e)
+        if isinstance(reason, TimeoutError) or "timed out" in str(reason).lower():
+            raise DueyError(_slow_msg(host, timeout), "timeout")
         if "ssl" in str(reason).lower() or "certificate" in str(reason).lower():
             raise DueyError("Couldn't make a secure connection to %s (certificate problem). "
                             "Double-check the address is correct and starts with https://." % host)
         raise DueyError("Couldn't reach %s. Check the address and your internet connection." % host)
     except (TimeoutError, OSError):
-        raise DueyError("The connection to %s timed out. Try again in a moment." %
-                        (urllib.parse.urlparse(url).netloc or "your school's site"))
+        raise DueyError(_slow_msg(urllib.parse.urlparse(url).netloc or "your school's site", timeout), "timeout")
 
 
 def strip_html(s):
@@ -332,7 +367,7 @@ def fetch_ical(url):
     url = url.strip()
     if url.lower().startswith("webcal://"):
         url = "https://" + url[9:]
-    body, _ = http(url)
+    body, _ = http(url, timeout=60, retries=1)
     if "BEGIN:VCALENDAR" not in body:
         raise DueyError("That link didn't return a calendar. Make sure you copied the whole "
                         "calendar link (it usually ends in .ics or has 'export' in it).")
@@ -640,19 +675,21 @@ def prepare_settings(cfg, incoming, changed_connection):
         elif reason == "sso":
             return ("Your school uses single sign-on, which blocks signing in this way entirely. "
                     "Generate an access token from your account settings instead, or use the "
-                    "calendar link above \u2014 it works everywhere, SSO included.")
+                    "calendar link above \u2014 it works everywhere, SSO included." + EXT_HINT)
         elif reason and reason != "not this system":
             return "Your school's site said: \u201c%s\u201d" % reason
         else:
             return ("That didn't work. Signing in this way only works on some school portals. "
                     "Generate an access token from your account settings instead, or use the "
-                    "calendar link above \u2014 it works everywhere.")
+                    "calendar link above \u2014 it works everywhere." + EXT_HINT)
     elif changed_connection:
         cfg["api_kind"] = ""  # the address, mode, or token actually changed; re-detect on next sync
     return None
 
 
 def fetch_items(cfg):
+    if cfg["mode"] == "ext":
+        return load_ext_items()
     if cfg["mode"] == "ical":
         return fetch_items_ical(cfg)
     cached = cfg.get("api_kind") if cfg.get("api_kind") in API_KINDS else None
@@ -679,13 +716,13 @@ def fetch_items(cfg):
         save_cfg(cfg)
     for e in errs.values():
         if isinstance(e, DueyError) and e.code == 401:
-            raise e  # the key was rejected - say so plainly
+            raise DueyError(str(e) + EXT_HINT, 401)  # the key was rejected - say so plainly
     me = errs.get("moodle")
     if isinstance(me, DueyError) and me.code == 0 and "didn't look like" not in str(me):
-        raise me  # the portal itself said something specific (e.g. keys not allowed)
+        raise DueyError(str(me) + EXT_HINT, 0)  # the portal itself said something specific
     raise DueyError("Duey couldn't connect using that address and token together. Double-check both "
                     "\u2014 the token is the most common culprit \u2014 or use the calendar link "
-                    "instead, which works everywhere.")
+                    "instead, which works everywhere." + EXT_HINT)
 # ---------------------------------------------------------------------------
 
 
@@ -956,11 +993,97 @@ def sync():
         SYNC_LOCK.release()
 
 
+# ----------------------------------------------------------------------------
+# Browser extension intake: the extension reads the portal while you're logged in
+# and hands the list to Duey here, on this computer only.
+# ----------------------------------------------------------------------------
+def ensure_ext_code():
+    cfg = load_cfg()
+    if not cfg.get("ext_code"):
+        raw = "".join(secrets.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(8))
+        cfg["ext_code"] = raw[:4] + "-" + raw[4:]
+        save_cfg(cfg)
+    return cfg["ext_code"]
+
+
+def load_ext_items():
+    raw = meta_get("ext_items")
+    if raw is None:
+        raise DueyError("Waiting for the first update from the browser extension.")
+    return json.loads(raw)
+
+
+def ingest(body):
+    cfg = load_cfg()
+    code = str(body.get("code") or "").strip().upper()
+    real = str(cfg.get("ext_code") or "")
+    if not real or not hmac.compare_digest(code.encode(), real.encode()):
+        return {"ok": False, "error": "That pairing code doesn't match. Copy it from Duey's settings (Browser extension)."}
+    if body.get("check"):
+        return {"ok": True}
+    if cfg["mode"] != "ext":
+        cfg["mode"] = "ext"
+        cfg["api_kind"] = ""
+        save_cfg(cfg)
+    meta_set("ext_paired", "1")
+    if body.get("error"):
+        meta_set("last_error", str(body["error"])[:300])
+        return {"ok": True}
+    clean = []
+    rows = body.get("items")
+    for r in (rows if isinstance(rows, list) else [])[:500]:
+        try:
+            url = str(r.get("url") or "")
+            clean.append({"id": str(r["id"])[:80], "course": str(r.get("course") or "General")[:120],
+                          "title": str(r.get("title") or "Untitled")[:300], "due": int(r["due"]),
+                          "url": url if re.match(r"https?://", url) else "",
+                          "desc": strip_html(str(r.get("desc") or "")),
+                          "kind": str(r.get("kind") or "assignment")[:20], "points": None,
+                          "done": True if r.get("done") is True else None})
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    meta_set("ext_items", json.dumps(clean))
+    return sync()
+
+
+def privacy_html():
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "PRIVACY.md"), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = ["# Privacy", "PRIVACY.md wasn't found next to duey.py."]
+    out, in_list = [], False
+    for ln in lines:
+        item = ln.startswith("- ")
+        if in_list and not item:
+            out.append("</ul>")
+            in_list = False
+        if item:
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            out.append("<li>%s</li>" % html.escape(ln[2:]))
+        elif ln.startswith("## "):
+            out.append("<h2>%s</h2>" % html.escape(ln[3:]))
+        elif ln.startswith("# "):
+            out.append("<h1>%s</h1>" % html.escape(ln[2:]))
+        elif ln.strip():
+            out.append("<p>%s</p>" % html.escape(ln))
+    if in_list:
+        out.append("</ul>")
+    return ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>Duey privacy</title><style>body{font:16px/1.55 system-ui,'Segoe UI',sans-serif;max-width:46em;"
+            "margin:32px auto;padding:0 20px;color:#12172E}h1{font-size:30px}h2{font-size:20px;margin-top:28px}"
+            "li{margin:6px 0}</style>" + "".join(out))
+
+
 def worker():
     while True:
         try:
             cfg = load_cfg()
-            if configured(cfg):
+            if cfg.get("mode") == "ext":
+                check_reminders()
+            elif configured(cfg):
                 last = int(meta_get("last_attempt", 0) or 0)
                 wait = 120 if meta_get("last_error") else max(1, int(cfg["sync_minutes"])) * 60
                 if time.time() - last >= wait:
@@ -1130,6 +1253,7 @@ def public_settings(cfg):
     s = {k: v for k, v in cfg.items() if k not in SECRET_KEYS}
     for k in SECRET_KEYS:
         s["has_" + k] = bool(cfg.get(k))
+    s["ext_path"] = EXT_DIR if os.path.isdir(EXT_DIR) else ""
     return s
 
 
@@ -1437,7 +1561,10 @@ dialog::backdrop{background:rgba(18,23,46,.45)}
 .field input,.field select{border:1.5px solid var(--line);border-radius:9px;padding:10px 12px;background:#fff;width:100%;min-width:0}
 .field input:focus,.field select:focus{outline:2.5px solid var(--a5-t);border-color:var(--navy)}
 .row2{display:grid;grid-template-columns:1fr 110px;gap:12px}
-.seg{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.seg{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px}
+.codebox{font:700 28px/1 var(--display);letter-spacing:.12em;padding:14px 16px;border:1.5px dashed var(--navy);border-radius:10px;background:var(--line2);user-select:all;text-align:center}
+.hint{font-size:13.5px;color:var(--ink2);margin-top:10px}
+code{overflow-wrap:anywhere;background:var(--line2);padding:2px 6px;border-radius:6px;font-size:13px}
 .seg label{border:1.5px solid var(--line);border-radius:10px;padding:10px 12px;cursor:pointer;display:block;font-weight:600;position:relative}
 .seg label small{display:block;font-weight:500;color:var(--ink2)}
 .seg input{position:absolute;opacity:0}
@@ -1535,13 +1662,14 @@ details ol{margin:8px 0 4px;padding-left:20px;display:grid;gap:6px;font-size:14.
 <dialog id="settings">
   <div class="dlg">
     <h2>Settings</h2>
-    <p style="color:var(--ink2);margin-top:6px">Everything stays on this computer. Blank password boxes keep what you saved before.</p>
+    <p style="color:var(--ink2);margin-top:6px">Your settings and deadlines are saved on this computer only. Optional extras (email, Claude, YouTube) send limited data when you turn them on. <a href="/privacy" target="_blank" rel="noopener noreferrer">How Duey handles your data</a>. Blank password boxes keep what you saved before.</p>
 
     <fieldset>
       <legend>Connect your school portal</legend>
       <div class="seg" role="radiogroup" aria-label="How to connect">
         <label><input type="radio" name="mode" value="ical"> Calendar link<small>Easiest. Works for everyone.</small></label>
-        <label><input type="radio" name="mode" value="api"> Security key<small>Richer details, knows what you've handed in.</small></label>
+        <label><input type="radio" name="mode" value="api"> Security key<small>Knows what you've handed in, if your school offers one.</small></label>
+        <label><input type="radio" name="mode" value="ext"> Browser extension<small>No key needed. Knows what you've handed in.</small></label>
       </div>
 
       <div id="pane-ical">
@@ -1559,6 +1687,22 @@ details ol{margin:8px 0 4px;padding-left:20px;display:grid;gap:6px;font-size:14.
         </details>
       </div>
 
+      <div id="pane-ext" hidden>
+        <p style="margin-top:12px">Use this when there's no calendar link or security key that does the job. A small add-on for Chrome, Edge or Brave reads your deadlines while you're logged in and hands them to Duey on this computer. Your password is never shared.</p>
+        <div class="field"><label>Your pairing code</label><div class="codebox" id="extCode">&nbsp;</div>
+          <small>You'll type this into the extension once.</small></div>
+        <details open><summary>Install it (about a minute)</summary>
+          <ol>
+            <li>In your browser's address bar, go to <b>chrome://extensions</b> (Edge: <b>edge://extensions</b>).</li>
+            <li>Turn on <b>Developer mode</b> (the switch in the top right).</li>
+            <li>Click <b>Load unpacked</b> and pick this folder: <code id="extPath"></code></li>
+            <li>Click the puzzle-piece icon in your toolbar and pin <b>Duey</b>.</li>
+            <li>Open your course portal and log in. Click the Duey icon, type the pairing code, and press <b>Connect</b>.</li>
+          </ol>
+        </details>
+        <p class="hint">Press Save below first, then follow the steps. Keep your browser open and Duey stays up to date.</p>
+      </div>
+
       <div id="pane-api" hidden>
         <div class="field">
           <label for="f_addr">School portal address</label>
@@ -1568,6 +1712,7 @@ details ol{margin:8px 0 4px;padding-left:20px;display:grid;gap:6px;font-size:14.
           <label for="f_key">Security key (access token)</label>
           <input id="f_key" type="password" autocomplete="new-password">
         </div>
+        <p class="hint">No security key on your account, or it doesn't work? <button class="linkbtn" type="button" data-act="gotoext">Use the browser extension instead</button>.</p>
         <details><summary>Or sign in once with your school username and password</summary>
           <div class="field"><label for="f_user">Username</label><input id="f_user" autocomplete="off"></div>
           <div class="field"><label for="f_pass">Password</label><input id="f_pass" type="password" autocomplete="off">
@@ -1954,12 +2099,15 @@ const F = id => document.getElementById(id);
 function setMode(m){
   F("pane-ical").hidden = m !== "ical";
   F("pane-api").hidden = m !== "api";
+  F("pane-ext").hidden = m !== "ext";
   document.querySelectorAll('input[name=mode]').forEach(r => r.checked = r.value === m);
 }
 function openSettings(){
   const s = S ? S.settings : {};
   setMode(s.mode || "ical");
   F("f_addr").value = (s.has_token && s.base_url) ? s.base_url : "";
+  F("extCode").textContent = s.ext_code || "";
+  F("extPath").textContent = s.ext_path || "the duey-extension folder that came with duey.py";
   F("f_cal").value = ""; F("f_key").value = "";
   F("f_cal").placeholder = s.has_ical_url ? "Saved. Leave blank to keep it." : "Paste your calendar / iCal link here";
   F("f_key").placeholder = s.has_token ? "Saved. Leave blank to keep it." : "";
@@ -2009,6 +2157,7 @@ document.addEventListener("click", async e => {
   else if (act === "desk"){ await Notification.requestPermission(); renderPanel(); }
   else if (act === "settings") openSettings();
   else if (act === "cancelset") F("settings").close();
+  else if (act === "gotoext") setMode("ext");
   else if (act === "gmail"){ F("f_smtp_host").value = "smtp.gmail.com"; F("f_smtp_port").value = 587; if (!F("f_smtp_user").value) F("f_smtp_user").value = F("f_email_to").value; }
   else if (act === "saveset"){
     setStatus("Saving and checking your school portal…");
@@ -2017,7 +2166,7 @@ document.addEventListener("click", async e => {
     btnEl.disabled = false;
     if (!r.ok){ setStatus(r.error || "Something went wrong.", "err"); await load(true); return; }
     F("settings").close(); await load(true);
-    toast({kind:"system", title:"Saved", body:"Found " + plural(r.count || 0, "deadline") + "."});
+    toast({kind:"system", title:"Saved", body: r.waiting ? "Now install the extension and enter your pairing code." : "Found " + plural(r.count || 0, "deadline") + "."});
   }
   else if (act === "testmail"){
     setStatus("Sending…");
@@ -2100,6 +2249,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, PAGE, "text/html; charset=utf-8")
         if u.path == "/api/state":
             return self._send(200, build_state())
+        if u.path == "/privacy":
+            return self._send(200, privacy_html(), "text/html; charset=utf-8")
+        if u.path == "/api/ping":
+            c = load_cfg()
+            want = float(meta_get("ext_want", 0) or 0) > float(meta_get("last_sync", 0) or 0)
+            return self._send(200, {"duey": True, "mode": c["mode"], "every": int(c["sync_minutes"]), "want": want})
         if u.path.startswith("/api/help/"):
             item_id = urllib.parse.unquote(u.path[len("/api/help/"):])
             refresh = "refresh=1" in (u.query or "")
@@ -2116,11 +2271,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "bad request"})
         p = self.path
         if p == "/api/sync":
+            if load_cfg()["mode"] == "ext":
+                meta_set("ext_want", time.time())   # the extension polls this and refreshes within a minute
+                return self._send(200, {"ok": True})
             return self._send(200, sync())
+        if p == "/api/ingest":
+            return self._send(200, ingest(body))
         if p == "/api/settings":
             err = apply_settings(body.get("settings"))
             if err:
                 return self._send(200, {"ok": False, "error": err})
+            cfg2 = load_cfg()
+            if cfg2["mode"] == "ext" and not configured(cfg2):
+                return self._send(200, {"ok": True, "count": 0, "waiting": True})
             res = sync() if body.get("sync") else {"ok": True}
             return self._send(200, res)
         if p == "/api/test-email":
@@ -2163,6 +2326,7 @@ def main():
             continue
     if not server:
         sys.exit("Couldn't find a free port. Close other Duey windows and try again.")
+    ensure_ext_code()
     threading.Thread(target=worker, daemon=True).start()
     url = "http://127.0.0.1:%d" % port
     print("Duey is running at %s" % url)
